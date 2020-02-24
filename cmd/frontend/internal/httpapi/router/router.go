@@ -38,6 +38,7 @@ const (
 	GitResolveRevision     = "internal.git.resolve-revision"
 	GitTar                 = "internal.git.tar"
 	GitExec                = "internal.git.exec"
+	GitBatchExec           = "internal.git.batch-exec"
 	PhabricatorRepoCreate  = "internal.phabricator.repo.create"
 	ReposGetByName         = "internal.repos.get-by-name"
 	ReposInventoryUncached = "internal.repos.inventory-uncached"
@@ -102,6 +103,7 @@ func NewInternal(base *mux.Router) *mux.Router {
 	base.Path("/send-email").Methods("POST").Name(SendEmail)
 	base.Path("/extension").Methods("POST").Name(Extension)
 	base.Path("/git/{RepoID:[0-9]+}/exec").Methods("POST").Name(GitExec)
+	base.Path("/git/{RepoID:[0-9]+}/batch-exec").Methods("POST").Name(GitBatchExec)
 	base.Path("/git/{RepoName:.*}/resolve-revision/{Spec}").Methods("GET").Name(GitResolveRevision)
 	base.Path("/git/{RepoName:.*}/tar/{Commit}").Methods("GET").Name(GitTar)
 	base.Path("/phabricator/repo-create").Methods("POST").Name(PhabricatorRepoCreate)

@@ -19,9 +19,24 @@ type ExecRequest struct {
 	// cloned on the gitserver, the request will fail.
 	URL string `json:"url,omitempty"`
 
-	EnsureRevision string      `json:"ensureRevision"`
-	Args           []string    `json:"args"`
-	Opt            *RemoteOpts `json:"opt"`
+	EnsureRevision string   `json:"ensureRevision"`
+	Args           []string `json:"args"`
+}
+
+type BatchExecRequest struct {
+	Repo api.RepoName `json:"repo"`
+
+	// URL is the repository's Git remote URL. If the gitserver already has cloned the repository,
+	// this field is optional (it will use the last-used Git remote URL). If the repository is not
+	// cloned on the gitserver, the request will fail.
+	URL string `json:"url,omitempty"`
+
+	EnsureRevisions []string              `json:"ensureRevisions"`
+	Requests        []BatchExecSubRequest `json:"requests"`
+}
+
+type BatchExecSubRequest struct {
+	Args []string `json:"args"`
 }
 
 // RemoteOpts configures interactions with a remote repository.

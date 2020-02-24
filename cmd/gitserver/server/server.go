@@ -45,6 +45,9 @@ import (
 // tempDirName is the name used for the temporary directory under ReposDir.
 const tempDirName = ".tmp"
 
+// maxNumBatchWorkers is the maximum concurrency for batch exec requests.
+const maxNumBatchWorkers = 50
+
 // traceLogs is controlled via the env SRC_GITSERVER_TRACE. If true we trace
 // logs to stderr
 var traceLogs bool
@@ -99,6 +102,22 @@ func runCommand(ctx context.Context, cmd *exec.Cmd) (exitCode int, err error) {
 		exitStatus = cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
 	}
 	return exitStatus, err
+}
+
+// specialCaseExec performs fast-path special cases of a git command. If the command can be handled without
+// spawning a child process, the stdout of the command will be returned. If the command cannot be handled with
+// a special fast-path, this function returns an empty string.
+func specialCaseExec(ctx context.Context, dir GitDir, args []string) string {
+	// Special-case `git rev-parse HEAD` requests. These are invoked by search queries for every repo in scope.
+	// For searches over large repo sets (> 1k), this leads to too many child process execs, which can lead
+	// to a persistent failure mode where every exec takes > 10s, which is disastrous for gitserver performance.
+	if len(args) == 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+		if resolved, err := quickRevParseHead(dir); err == nil && isAbsoluteRevision(resolved) {
+			return resolved
+		}
+	}
+
+	return ""
 }
 
 // Server is a gitserver server.
@@ -193,6 +212,7 @@ func shortGitCommandSlow(args []string) time.Duration {
 // that may take a while for large repos. These types of commands should
 // be run in the background.
 var longGitCommandTimeout = time.Hour
+var batchExecCommandTimeout = longGitCommandTimeout
 
 // Handler returns the http.Handler that should be used to serve requests.
 func (s *Server) Handler() http.Handler {
@@ -225,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/archive", s.handleArchive)
 	mux.HandleFunc("/exec", s.handleExec)
+	mux.HandleFunc("/batch-exec", s.handleBatchExec)
 	mux.HandleFunc("/list", s.handleList)
 	mux.HandleFunc("/list-gitolite", s.handleListGitolite)
 	mux.HandleFunc("/is-repo-cloneable", s.handleIsRepoCloneable)
@@ -608,42 +629,14 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request, req *protocol.Exec
 	}
 
 	dir := s.dir(req.Repo)
-	cloneProgress, cloneInProgress := s.locker.Status(dir)
-	if cloneInProgress {
-		status = "clone-in-progress"
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{
-			CloneInProgress: true,
-			CloneProgress:   cloneProgress,
-		})
-		return
-	}
-	if !repoCloned(dir) {
-		if req.URL == "" {
-			status = "repo-not-found"
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{CloneInProgress: false})
-			return
-		}
-		cloneProgress, err := s.cloneRepo(ctx, req.Repo, req.URL, nil)
-		if err != nil {
-			log15.Debug("error cloning repo", "repo", req.Repo, "err", err)
-			status = "repo-not-found"
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{CloneInProgress: false})
-			return
-		}
-		status = "clone-in-progress"
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{
-			CloneInProgress: true,
-			CloneProgress:   cloneProgress,
-		})
+	status = s.handleExecRepoStatus(ctx, w, req.Repo, req.URL, dir)
+	if status != "" {
 		return
 	}
 
-	didUpdate := s.ensureRevision(ctx, req.Repo, req.URL, req.EnsureRevision, dir)
-	if didUpdate {
+	if s.shouldEnsureRevision(req.EnsureRevision, dir) {
+		// revision not found, update now
+		_ = s.doRepoUpdate(ctx, req.Repo, req.URL)
 		ensureRevisionStatus = "fetched"
 	} else {
 		ensureRevisionStatus = "noop"
@@ -654,17 +647,13 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request, req *protocol.Exec
 	w.Header().Add("Trailer", "X-Exec-Stderr")
 	w.WriteHeader(http.StatusOK)
 
-	// Special-case `git rev-parse HEAD` requests. These are invoked by search queries for every repo in scope.
-	// For searches over large repo sets (> 1k), this leads to too many child process execs, which can lead
-	// to a persistent failure mode where every exec takes > 10s, which is disastrous for gitserver performance.
-	if len(req.Args) == 2 && req.Args[0] == "rev-parse" && req.Args[1] == "HEAD" {
-		if resolved, err := quickRevParseHead(dir); err == nil && isAbsoluteRevision(resolved) {
-			_, _ = w.Write([]byte(resolved))
-			w.Header().Set("X-Exec-Error", "")
-			w.Header().Set("X-Exec-Exit-Status", "0")
-			w.Header().Set("X-Exec-Stderr", "")
-			return
-		}
+	specialCaseResponse := specialCaseExec(ctx, dir, req.Args)
+	if specialCaseResponse != "" {
+		_, _ = w.Write([]byte(specialCaseResponse))
+		w.Header().Set("X-Exec-Error", "")
+		w.Header().Set("X-Exec-Exit-Status", "0")
+		w.Header().Set("X-Exec-Stderr", "")
+		return
 	}
 
 	var stderrBuf bytes.Buffer
@@ -684,12 +673,315 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request, req *protocol.Exec
 	stderrN = stderrW.n
 
 	stderr := stderrBuf.String()
-	checkMaybeCorruptRepo(req.Repo, dir, stderr)
+	_ = checkMaybeCorruptRepo(req.Repo, dir, stderr)
 
 	// write trailer
 	w.Header().Set("X-Exec-Error", errorString(execErr))
 	w.Header().Set("X-Exec-Exit-Status", status)
 	w.Header().Set("X-Exec-Stderr", stderr)
+}
+
+func (s *Server) handleBatchExec(w http.ResponseWriter, r *http.Request) {
+	var req protocol.BatchExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.batchExec(w, r, &req)
+}
+
+type batchExecResponse struct {
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	Error      string `json:"error"`
+	ExitStatus int    `json:"exitStatus"`
+	Status     string `json:"status"`
+}
+
+func (s *Server) batchExec(w http.ResponseWriter, r *http.Request, req *protocol.BatchExecRequest) {
+	ctx, cancel := context.WithTimeout(r.Context(), batchExecCommandTimeout)
+	defer cancel()
+
+	start := time.Now()
+	var batchStart time.Time // set once we have ensured commit
+	var ensureRevisionStatus string
+	var status string
+
+	req.Repo = protocol.NormalizeRepo(req.Repo)
+
+	// Instrumentation
+	{
+		repo := repotrackutil.GetTrackedRepo(req.Repo)
+
+		var tr *trace.Trace
+		tr, ctx = trace.New(ctx, "batchExec", string(req.Repo))
+		tr.LogFields(
+			otlog.String("remote_url", req.URL),
+			otlog.String("ensure_revisions", strings.Join(req.EnsureRevisions, ",")),
+		)
+
+		batchExecRunning.WithLabelValues(repo).Inc()
+		defer func() {
+			tr.LogFields(
+				otlog.String("status", status),
+				otlog.String("ensure_revision_status", ensureRevisionStatus),
+				otlog.Int("num_requests", len(req.Requests)),
+			)
+			tr.Finish()
+
+			duration := time.Since(start)
+			batchExecRunning.WithLabelValues(repo).Dec()
+			batchExecDuration.WithLabelValues(repo, status).Observe(duration.Seconds())
+
+			var fetchDuration time.Duration
+			if !batchStart.IsZero() {
+				fetchDuration = batchStart.Sub(start)
+			}
+
+			if honey.Enabled() || traceLogs {
+				ev := honey.Event("gitserver-batch-exec")
+				ev.AddField("repo", req.Repo)
+				ev.AddField("remote_url", req.URL)
+				ev.AddField("ensure_revision", strings.Join(req.EnsureRevisions, ","))
+				ev.AddField("ensure_revision_status", ensureRevisionStatus)
+				ev.AddField("client", r.UserAgent())
+				ev.AddField("duration_ms", duration.Seconds()*1000)
+				ev.AddField("status", status)
+				ev.AddField("num_requests", len(req.Requests))
+				if !batchStart.IsZero() {
+					ev.AddField("fetch_duration_ms", fetchDuration.Seconds()*1000)
+				}
+
+				if honey.Enabled() {
+					_ = ev.Send()
+				}
+				if traceLogs {
+					log15.Debug("TRACE gitserver batchExec", mapToLog15Ctx(ev.Fields())...)
+				}
+			}
+
+			if fetchDuration > 10*time.Second {
+				log15.Warn("Slow fetch/clone for batchExec request", "repo", req.Repo, "duration", fetchDuration)
+			}
+		}()
+	}
+
+	dir := s.dir(req.Repo)
+	status = s.handleExecRepoStatus(ctx, w, req.Repo, req.URL, dir)
+	if status != "" {
+		return
+	}
+
+	shouldUpdate := false
+	for _, rev := range req.EnsureRevisions {
+		shouldUpdate = s.shouldEnsureRevision(rev, dir)
+		if shouldUpdate {
+			break
+		}
+	}
+
+	if shouldUpdate {
+		// some revision not found, update now
+		_ = s.doRepoUpdate(ctx, req.Repo, req.URL)
+		ensureRevisionStatus = "fetched"
+	} else {
+		ensureRevisionStatus = "noop"
+	}
+
+	batchStart = time.Now()
+
+	inputs := make(chan int, len(req.Requests))
+	for i := range req.Requests {
+		inputs <- i
+	}
+	close(inputs)
+
+	var (
+		numWorkers  = len(req.Requests)
+		responses   = make([]batchExecResponse, len(req.Requests))
+		responsesMu sync.Mutex
+		wg          sync.WaitGroup
+	)
+
+	if numWorkers > maxNumBatchWorkers {
+		numWorkers = maxNumBatchWorkers
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range inputs {
+				resp := s.execBatchSubRequest(ctx, r, dir, req, req.Requests[i])
+				responsesMu.Lock()
+				responses[i] = resp
+				responsesMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, resp := range responses {
+		if checkMaybeCorruptRepo(req.Repo, dir, resp.Stderr) {
+			break
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(responses)
+}
+
+func (s *Server) handleExecRepoStatus(ctx context.Context, w http.ResponseWriter, repo api.RepoName, url string, dir GitDir) string {
+	cloneProgress, cloneInProgress := s.locker.Status(dir)
+	if cloneInProgress {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{
+			CloneInProgress: true,
+			CloneProgress:   cloneProgress,
+		})
+		return "clone-in-progress"
+	}
+
+	if repoCloned(dir) {
+		return ""
+	}
+
+	if url == "" {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{CloneInProgress: false})
+		return "repo-not-found"
+	}
+
+	cloneProgress, err := s.cloneRepo(ctx, repo, url, nil)
+	if err != nil {
+		log15.Debug("error cloning repo", "repo", repo, "err", err)
+
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{CloneInProgress: false})
+		return "repo-not-found"
+	}
+
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(&protocol.NotFoundPayload{
+		CloneInProgress: true,
+		CloneProgress:   cloneProgress,
+	})
+	return "clone-in-progress"
+}
+
+func (s *Server) execBatchSubRequest(ctx context.Context, r *http.Request, dir GitDir, req *protocol.BatchExecRequest, subReq protocol.BatchExecSubRequest) batchExecResponse {
+	ctx, cancel := context.WithTimeout(ctx, shortGitCommandTimeout(subReq.Args))
+	defer cancel()
+
+	start := time.Now()
+	var cmdStart time.Time // set after checking special cases
+	exitStatus := -10810   // sentinel value to indicate not set
+	var stdoutN, stderrN int64
+	var status string
+	var execErr error
+
+	// Instrumentation
+	{
+		repo := repotrackutil.GetTrackedRepo(req.Repo)
+		cmd := ""
+		if len(subReq.Args) > 0 {
+			cmd = subReq.Args[0]
+		}
+		args := strings.Join(subReq.Args, " ")
+
+		var tr *trace.Trace
+		tr, ctx = trace.New(ctx, "exec."+cmd, string(req.Repo))
+		tr.LogFields(
+			otlog.Object("args", args),
+			otlog.String("remote_url", req.URL),
+		)
+
+		execRunning.WithLabelValues(cmd, repo).Inc()
+		defer func() {
+			tr.LogFields(
+				otlog.String("status", status),
+				otlog.Int64("stdout", stdoutN),
+				otlog.Int64("stderr", stderrN),
+			)
+			tr.SetError(execErr)
+			tr.Finish()
+
+			duration := time.Since(start)
+			execRunning.WithLabelValues(cmd, repo).Dec()
+			execDuration.WithLabelValues(cmd, repo, status).Observe(duration.Seconds())
+
+			var cmdDuration time.Duration
+			if !cmdStart.IsZero() {
+				cmdDuration = time.Since(cmdStart)
+			}
+
+			if honey.Enabled() || traceLogs {
+				ev := honey.Event("gitserver-exec")
+				ev.AddField("repo", req.Repo)
+				ev.AddField("remote_url", req.URL)
+				ev.AddField("cmd", cmd)
+				ev.AddField("args", args)
+				ev.AddField("client", r.UserAgent())
+				ev.AddField("duration_ms", duration.Seconds()*1000)
+				ev.AddField("stdout_size", stdoutN)
+				ev.AddField("stderr_size", stderrN)
+				ev.AddField("exit_status", exitStatus)
+				ev.AddField("status", status)
+				if execErr != nil {
+					ev.AddField("error", execErr.Error())
+				}
+				if !cmdStart.IsZero() {
+					ev.AddField("cmd_duration_ms", cmdDuration.Seconds()*1000)
+				}
+
+				if honey.Enabled() {
+					_ = ev.Send()
+				}
+				if traceLogs {
+					log15.Debug("TRACE gitserver exec", mapToLog15Ctx(ev.Fields())...)
+				}
+			}
+
+			if cmdDuration > shortGitCommandSlow(subReq.Args) {
+				log15.Warn("Long exec request", "repo", req.Repo, "args", subReq.Args, "duration", cmdDuration.Round(time.Millisecond))
+			}
+		}()
+	}
+
+	specialCaseResponse := specialCaseExec(ctx, dir, subReq.Args)
+	if specialCaseResponse != "" {
+		return batchExecResponse{Stdout: specialCaseResponse}
+	}
+
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	stdoutW := &writeCounter{w: &stdoutBuf}
+	stderrW := &writeCounter{w: &limitWriter{W: &stderrBuf, N: 1024}}
+
+	cmdStart = time.Now()
+	cmd := exec.CommandContext(ctx, "git", subReq.Args...)
+	cmd.Dir = string(dir)
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
+	exitStatus, execErr = runCommand(ctx, cmd)
+
+	status = strconv.Itoa(exitStatus)
+	stdoutN = stdoutW.n
+	stderrN = stderrW.n
+
+	errorMessage := ""
+	if execErr != nil {
+		errorMessage = execErr.Error()
+	}
+
+	return batchExecResponse{
+		Stdout:     stdoutBuf.String(),
+		Stderr:     stderrBuf.String(),
+		Error:      errorMessage,
+		ExitStatus: exitStatus,
+		Status:     status,
+	}
 }
 
 // setGitAttributes writes our global gitattributes to
@@ -1009,6 +1301,19 @@ var (
 		Help:      "gitserver.Command latencies in seconds.",
 		Buckets:   trace.UserLatencyBuckets,
 	}, []string{"cmd", "repo", "status"})
+	batchExecRunning = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "src",
+		Subsystem: "gitserver",
+		Name:      "batch_exec_running",
+		Help:      "number of batch gitserver.Command running concurrently.",
+	}, []string{"repo"})
+	batchExecDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "src",
+		Subsystem: "gitserver",
+		Name:      "batch_exec_duration_seconds",
+		Help:      "batch gitserver.Command latencies in seconds.",
+		Buckets:   trace.UserLatencyBuckets,
+	}, []string{"repo", "status"})
 	cloneQueue = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "src",
 		Subsystem: "gitserver",
@@ -1371,7 +1676,7 @@ func (s *Server) doRepoUpdate2(repo api.RepoName, url string) error {
 	return nil
 }
 
-func (s *Server) ensureRevision(ctx context.Context, repo api.RepoName, url, rev string, repoDir GitDir) (didUpdate bool) {
+func (s *Server) shouldEnsureRevision(rev string, repoDir GitDir) bool {
 	if rev == "" || rev == "HEAD" {
 		return false
 	}
@@ -1385,8 +1690,6 @@ func (s *Server) ensureRevision(ctx context.Context, repo api.RepoName, url, rev
 	if err := cmd.Run(); err == nil {
 		return false
 	}
-	// Revision not found, update before returning.
-	_ = s.doRepoUpdate(ctx, repo, url)
 	return true
 }
 

@@ -576,6 +576,48 @@ func serveGitExec(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func serveGitBatchExec(w http.ResponseWriter, r *http.Request) error {
+	defer r.Body.Close()
+	req := protocol.BatchExecRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return errors.Wrap(err, "Decode")
+	}
+
+	vars := mux.Vars(r)
+	repoID, err := strconv.ParseInt(vars["RepoID"], 10, 64)
+	if err != nil {
+		http.Error(w, "illegal repository id: "+err.Error(), http.StatusBadRequest)
+		return nil
+	}
+
+	repo, err := db.Repos.Get(r.Context(), api.RepoID(repoID))
+	if err != nil {
+		return err
+	}
+
+	// Set repo name in gitserver request payload
+	req.Repo = repo.Name
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(req); err != nil {
+		return errors.Wrap(err, "Encode")
+	}
+
+	// Find the correct shard to query
+	addr := gitserver.DefaultClient.AddrForRepo(r.Context(), repo.Name)
+
+	director := func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = addr
+		req.URL.Path = "/batch-exec"
+		req.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+		req.ContentLength = int64(buf.Len())
+	}
+
+	gitserver.DefaultReverseProxy.ServeHTTP(repo.Name, "POST", "batch-exec", director, w, r)
+	return nil
+}
+
 func handlePing(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "could not parse form: "+err.Error(), http.StatusBadRequest)

@@ -159,6 +159,122 @@ func TestRequest(t *testing.T) {
 	}
 }
 
+type BatchTest struct {
+	Name         string
+	Request      *http.Request
+	ExpectedCode int
+	ExpectedBody string
+}
+
+func TestBatchRequest(t *testing.T) {
+	tests := []BatchTest{
+		{
+			Name:         "Command",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "github.com/gorilla/mux", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusOK,
+			ExpectedBody: `[{"stdout":"teststdout","stderr":"teststderr","error":"","exitStatus":42,"status":"42"}]`,
+		},
+		{
+			Name:         "CommandWithURL",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "my-mux", "url": "https://github.com/gorilla/mux.git", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusOK,
+			ExpectedBody: `[{"stdout":"teststdout","stderr":"teststderr","error":"","exitStatus":42,"status":"42"}]`,
+		},
+		{
+			Name:         "NonexistingRepo",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "github.com/gorilla/doesnotexist", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusNotFound,
+			ExpectedBody: `{"cloneInProgress":false}`,
+		},
+		{
+			Name:         "NonexistingRepoWithURL",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "my-doesnotexist", "url": "https://github.com/gorilla/doesntexist.git", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusNotFound,
+			ExpectedBody: `{"cloneInProgress":false}`,
+		},
+		{
+			Name:         "UnclonedRepoWithoutURL",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "github.com/nicksnyder/go-i18n", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusNotFound,
+			ExpectedBody: `{"cloneInProgress":false}`, // no way for it to know the clone URL to start cloning
+		},
+		{
+			Name:         "UnclonedRepoWithURL",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "my-go-i18n", "url": "https://github.com/nicksnyder/go-i18n.git", "requests": [{"args": ["testcommand"]}]}`)),
+			ExpectedCode: http.StatusNotFound,
+			ExpectedBody: `{"cloneInProgress":true}`,
+		},
+		{
+			Name:         "Error",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader(`{"repo": "github.com/gorilla/mux", "requests": [{"args": ["testerror"]}]}`)),
+			ExpectedCode: http.StatusOK,
+			ExpectedBody: `[{"stdout":"","stderr":"","error":"testerror","exitStatus":0,"status":"0"}]`,
+		},
+		{
+			Name:         "EmptyBody",
+			Request:      httptest.NewRequest("POST", "/batch-exec", nil),
+			ExpectedCode: http.StatusBadRequest,
+			ExpectedBody: `EOF`,
+		},
+		{
+			Name:         "EmptyInput",
+			Request:      httptest.NewRequest("POST", "/batch-exec", strings.NewReader("{}")),
+			ExpectedCode: http.StatusNotFound,
+			ExpectedBody: `{"cloneInProgress":false}`,
+		},
+	}
+
+	s := &Server{ReposDir: "/testroot", skipCloneForTests: true}
+	h := s.Handler()
+
+	repoCloned = func(dir GitDir) bool {
+		return dir == s.dir("github.com/gorilla/mux") || dir == s.dir("my-mux")
+	}
+
+	testRepoExists = func(ctx context.Context, url string) error {
+		if url == "https://github.com/nicksnyder/go-i18n.git" {
+			return nil
+		}
+		return errors.New("not cloneable")
+	}
+	defer func() {
+		testRepoExists = nil
+	}()
+
+	runCommandMock = func(ctx context.Context, cmd *exec.Cmd) (int, error) {
+		switch cmd.Args[1] {
+		case "testcommand":
+			_, _ = cmd.Stdout.Write([]byte("teststdout"))
+			_, _ = cmd.Stderr.Write([]byte("teststderr"))
+			return 42, nil
+		case "testerror":
+			return 0, errors.New("testerror")
+		}
+		return 0, nil
+	}
+	defer func() { runCommandMock = nil }()
+
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			w := httptest.ResponseRecorder{Body: new(bytes.Buffer)}
+			h.ServeHTTP(&w, test.Request)
+
+			res := w.Result()
+			if res.StatusCode != test.ExpectedCode {
+				t.Errorf("wrong status: expected %d, got %d", test.ExpectedCode, w.Code)
+			}
+
+			body, err := ioutil.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.TrimSpace(string(body)) != test.ExpectedBody {
+				t.Errorf("wrong body: expected %q, got %q", test.ExpectedBody, string(body))
+			}
+		})
+	}
+}
+
 func BenchmarkQuickRevParseHead_packed_refs(b *testing.B) {
 	tmp, err := ioutil.TempDir("", "gitserver_test")
 	if err != nil {

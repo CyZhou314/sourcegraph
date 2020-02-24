@@ -652,9 +652,9 @@ func getRecloneTime(dir GitDir) (time.Time, error) {
 // context.
 var maybeCorruptStderrRe = lazyregexp.NewPOSIX(`^error: (Could not read|packfile) `)
 
-func checkMaybeCorruptRepo(repo api.RepoName, dir GitDir, stderr string) {
+func checkMaybeCorruptRepo(repo api.RepoName, dir GitDir, stderr string) bool {
 	if !maybeCorruptStderrRe.MatchString(stderr) {
-		return
+		return false
 	}
 
 	log15.Warn("marking repo for recloning due to stderr output indicating repo corruption", "repo", repo, "stderr", stderr)
@@ -665,6 +665,8 @@ func checkMaybeCorruptRepo(repo api.RepoName, dir GitDir, stderr string) {
 	if err != nil {
 		log15.Error("failed to set maybeCorruptRepo config", repo, "repo", "error", err)
 	}
+
+	return true
 }
 
 func gitConfigGet(dir GitDir, key string) (string, error) {
